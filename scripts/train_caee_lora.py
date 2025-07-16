@@ -1,92 +1,104 @@
 import os
 import json
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 import torch
+from datasets import load_dataset, Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+)
+from peft import get_peft_model, LoraConfig, TaskType
+from transformers import BitsAndBytesConfig
 
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # You can change this
-DATA_PATH = "data/reddit_empathy.jsonl"
-SAVE_DIR = "models/lora/"
+# MODEL NAME
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
 
-# 1. Load dataset from JSONL
-def load_json_dataset(path):
-    with open(path, "r", encoding="utf-8") as f:
-        samples = [json.loads(line) for line in f]
-    return Dataset.from_list(samples)
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+tokenizer.pad_token = tokenizer.eos_token
 
-# 2. Format input/output for instruction tuning
-def format_example(example):
-    joined_context = "\n".join(example["context"])
-    formatted = {
-        "text": f"### Input:\n{joined_context}\n\n### Response:\n{example['response']}\n\n### Labels:\n{', '.join(example['labels'])}"
+# Load model with 4-bit quantization
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+
+# Apply LoRA
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],  # Adjust depending on architecture
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
+# Load dataset
+data_path = "data/reddit_empathy.jsonl"
+with open(data_path, "r") as f:
+    data = [json.loads(line) for line in f]
+
+dataset = Dataset.from_list(data)
+
+# Tokenization function
+def tokenize(batch):
+    prompt = ""
+    for turn in batch["context"]:
+        prompt += turn.strip() + "\n"
+    prompt += f"Response: {batch['response']}"
+    input_ids = tokenizer(prompt, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
+    return {
+        "input_ids": input_ids["input_ids"][0],
+        "attention_mask": input_ids["attention_mask"][0],
+        "labels": input_ids["input_ids"][0],
     }
-    return formatted
 
-# 3. Tokenize
-def tokenize_function(example, tokenizer):
-    return tokenizer(
-        example["text"],
-        padding="max_length",
-        truncation=True,
-        max_length=512,
-        return_tensors="pt"
-    )
+tokenized_dataset = dataset.map(tokenize)
 
-def main():
-    print("📦 Loading dataset...")
-    raw_dataset = load_json_dataset(DATA_PATH)
-    formatted_dataset = raw_dataset.map(format_example)
-    
-    print("🔠 Loading tokenizer and model...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
+# Data collator
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Prepare model for LoRA
-    model = prepare_model_for_kbit_training(model)
-    peft_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM
-    )
-    model = get_peft_model(model, peft_config)
+# Training arguments
+training_args = TrainingArguments(
+    output_dir="outputs/caee-v3-mistral",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    num_train_epochs=2,
+    learning_rate=2e-5,
+    logging_dir="logs",
+    logging_steps=10,
+    save_steps=100,
+    save_total_limit=1,
+    bf16=False,  # Colab GPUs usually support float16, not bf16
+    fp16=True,
+    report_to="none"
+)
 
-    print("🧪 Tokenizing dataset...")
-    tokenized_dataset = formatted_dataset.map(lambda e: tokenize_function(e, tokenizer), remove_columns=formatted_dataset.column_names)
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+)
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+# Start training
+trainer.train()
 
-    print("🛠️ Starting training...")
-    training_args = TrainingArguments(
-        output_dir=SAVE_DIR,
-        per_device_train_batch_size=4,
-        num_train_epochs=3,
-        logging_steps=10,
-        save_strategy="epoch",
-        fp16=True,
-        report_to="none"
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator
-    )
-
-    trainer.train()
-
-    print(f"✅ Saving LoRA adapter to {SAVE_DIR}")
-    model.save_pretrained(SAVE_DIR)
-    tokenizer.save_pretrained(SAVE_DIR)
-
-if __name__ == "__main__":
-    main()
+# Save model
+trainer.save_model("outputs/caee-v3-mistral")
+tokenizer.save_pretrained("outputs/caee-v3-mistral")
