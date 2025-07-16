@@ -1,120 +1,92 @@
+import os
 import json
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 import torch
-import os
 
-# === Configs ===
-MODEL_NAME = "google/gemma-2b-it"
-JSONL_PATH = "data/reddit_empathy.jsonl"
-MAX_LENGTH = 512
-USE_LORA = True
-BATCH_SIZE = 4
-EPOCHS = 3
-OUTPUT_DIR = "models/caee-gemma2b"
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # You can change this
+DATA_PATH = "data/reddit_empathy.jsonl"
+SAVE_DIR = "models/lora/"
 
-# === Load and format dataset ===
-def load_data(jsonl_path):
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        samples = [json.loads(line.strip()) for line in f]
+# 1. Load dataset from JSONL
+def load_json_dataset(path):
+    with open(path, "r", encoding="utf-8") as f:
+        samples = [json.loads(line) for line in f]
+    return Dataset.from_list(samples)
 
-    # Convert to HF dataset
-    dataset = Dataset.from_list(samples)
-    return dataset
-
-# === Prompt Template ===
+# 2. Format input/output for instruction tuning
 def format_example(example):
-    prompt = "\n".join(example["context"]) + "\nFriend:"
-    response = example["response"]
-    labels = example["labels"]
-    return {
-        "text": prompt,
-        "response": response,
-        "labels": labels
+    joined_context = "\n".join(example["context"])
+    formatted = {
+        "text": f"### Input:\n{joined_context}\n\n### Response:\n{example['response']}\n\n### Labels:\n{', '.join(example['labels'])}"
     }
+    return formatted
 
-# === Tokenize ===
-def tokenize_function(example, tokenizer, label2id):
-    formatted = format_example(example)
-    prompt = formatted["text"]
-    inputs = tokenizer(prompt, truncation=True, padding="max_length", max_length=MAX_LENGTH, return_tensors="pt")
-    input_ids = inputs["input_ids"][0]
-    attention_mask = inputs["attention_mask"][0]
+# 3. Tokenize
+def tokenize_function(example, tokenizer):
+    return tokenizer(
+        example["text"],
+        padding="max_length",
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    )
 
-    # Convert labels to binary vector
-    labels = [0] * len(label2id)
-    for lbl in formatted["labels"]:
-        if lbl in label2id:
-            labels[label2id[lbl]] = 1
+def main():
+    print("📦 Loading dataset...")
+    raw_dataset = load_json_dataset(DATA_PATH)
+    formatted_dataset = raw_dataset.map(format_example)
+    
+    print("🔠 Loading tokenizer and model...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": torch.tensor(labels, dtype=torch.float)
-    }
-
-# === Label list (16 needs)
-LABELS = [
-    "acknowledgment", "celebration", "clarity", "comfort", "connection",
-    "empathy", "encouragement", "guidance", "motivation", "neutral",
-    "reassurance", "safety", "support", "understanding", "validation", "companionship"
-]
-label2id = {label: i for i, label in enumerate(LABELS)}
-
-# === Load tokenizer + model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-bnb_config = BitsAndBytesConfig(load_in_4bit=True)
-base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config, device_map="auto")
-
-if USE_LORA:
-    base_model = prepare_model_for_kbit_training(base_model)
-    config = LoraConfig(
+    # Prepare model for LoRA
+    model = prepare_model_for_kbit_training(model)
+    peft_config = LoraConfig(
         r=8,
-        lora_alpha=32,
+        lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type=TaskType.CAUSAL_LM
     )
-    base_model = get_peft_model(base_model, config)
+    model = get_peft_model(model, peft_config)
 
-# === Load and tokenize dataset
-dataset = load_data(JSONL_PATH)
-tokenized_dataset = dataset.map(lambda ex: tokenize_function(ex, tokenizer, label2id), remove_columns=dataset.column_names)
+    print("🧪 Tokenizing dataset...")
+    tokenized_dataset = formatted_dataset.map(lambda e: tokenize_function(e, tokenizer), remove_columns=formatted_dataset.column_names)
 
-# === Training args
-training_args = TrainingArguments(
-    per_device_train_batch_size=BATCH_SIZE,
-    num_train_epochs=EPOCHS,
-    learning_rate=2e-4,
-    output_dir=OUTPUT_DIR,
-    save_total_limit=1,
-    evaluation_strategy="no",
-    logging_dir=f"{OUTPUT_DIR}/logs",
-    fp16=True,
-    report_to="none"
-)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-# === Custom Trainer with sigmoid loss
-class MultiLabelTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits[:, -1, :len(label2id)]  # only last token logits for multi-label
-        loss = torch.nn.BCEWithLogitsLoss()(logits, labels)
-        return (loss, outputs) if return_outputs else loss
+    print("🛠️ Starting training...")
+    training_args = TrainingArguments(
+        output_dir=SAVE_DIR,
+        per_device_train_batch_size=4,
+        num_train_epochs=3,
+        logging_steps=10,
+        save_strategy="epoch",
+        fp16=True,
+        report_to="none"
+    )
 
-# === Train!
-trainer = MultiLabelTrainer(
-    model=base_model,
-    args=training_args,
-    train_dataset=tokenized_dataset
-)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator
+    )
 
-trainer.train()
-base_model.save_pretrained(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
+    trainer.train()
 
-print("✅ Training complete.")
+    print(f"✅ Saving LoRA adapter to {SAVE_DIR}")
+    model.save_pretrained(SAVE_DIR)
+    tokenizer.save_pretrained(SAVE_DIR)
+
+if __name__ == "__main__":
+    main()
