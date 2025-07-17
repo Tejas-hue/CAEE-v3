@@ -1,0 +1,5 @@
+gradio>=4.0
+transformers
+torch
+peft
+accelerate
